@@ -44,6 +44,32 @@ function assertType(name, option, expectedType) {
 const extensionLogger = logger.loggerWithTag('@harperdb/nextjs', true);
 
 /**
+ * Normalize the base URL path provided by Harper into a canonical form.
+ *
+ * @param {string | undefined} urlPath
+ * @returns {string} Canonical base path (e.g. '/', '/app')
+ */
+function normalizeBaseUrlPath(urlPath) {
+	if (!urlPath || urlPath === '/') {
+		return '/';
+	}
+
+	let basePath = urlPath;
+
+	// Ensure leading slash
+	if (!basePath.startsWith('/')) {
+		basePath = '/' + basePath;
+	}
+
+	// Remove trailing slash (except for root)
+	if (basePath.length > 1 && basePath.endsWith('/')) {
+		basePath = basePath.slice(0, -1);
+	}
+
+	return basePath;
+}
+
+/**
  * Resolves the incoming extension options into a config for use throughout the extension.
  *
  * @param {ExtensionOptions} options - The options object to be resolved into a configuration
@@ -194,7 +220,7 @@ export function startOnMainThread(options = {}) {
 export function start(options = {}) {
 	const config = resolveConfig(options);
 	return {
-		async handleDirectory(_, componentPath) {
+		async handleDirectory(urlPath, componentPath) {
 			// Assert the component path is a Next.js app. This will throw if it is not.
 			assertNextJSApp(componentPath);
 
@@ -213,7 +239,7 @@ export function start(options = {}) {
 			}
 
 			// Start the Next.js server
-			await serve(config, componentPath, options.server);
+			await serve(config, componentPath, urlPath, options.server);
 
 			return true;
 		},
@@ -355,34 +381,102 @@ async function build(config, componentPath, server) {
  *
  * @param {Required<ExtensionOptions>} config
  * @param {string} componentPath
+ * @param {string | undefined} urlPath
  */
-async function serve(config, componentPath, server) {
+async function serve(config, componentPath, urlPath, server) {
+	const basePath = normalizeBaseUrlPath(urlPath);
+
+	extensionLogger.info?.(
+		`serve: starting for ${componentPath} (dev=${config.dev}, port=${config.port}, securePort=${config.securePort}, basePath=${basePath})`
+	);
+
 	const componentRequire = createRequire(join(componentPath, 'package.json'));
 
 	const next = (await import(pathToFileURL(componentRequire.resolve('next')))).default;
 
 	const app = next({ dir: componentPath, dev: config.dev });
 
+	extensionLogger.debug?.('serve: calling app.prepare()');
 	await app.prepare();
+	extensionLogger.debug?.('serve: app.prepare() completed');
 
 	const requestHandler = app.getRequestHandler();
 
+	const httpOptions = { port: config.port, securePort: config.securePort };
+	extensionLogger.info?.(`serve: registering HTTP handler with options ${JSON.stringify(httpOptions)}`);
 	server.http(
 		(request, next) => {
-			return request._nodeResponse === undefined
-				? next(request)
-				: requestHandler(request._nodeRequest, request._nodeResponse, urlParse(request._nodeRequest.url, true));
+			const hasNodeResponse = request._nodeResponse !== undefined;
+			const originalUrl = request.url ?? request._nodeRequest?.url ?? '/';
+
+			extensionLogger.debug?.(
+				`serve: HTTP request url=${originalUrl} _nodeResponse=${
+					hasNodeResponse ? 'set' : 'undefined'
+				}`
+			);
+
+			if (!hasNodeResponse) {
+				extensionLogger.debug?.('serve: passing request to next handler (_nodeResponse undefined)');
+				return next(request);
+			}
+
+			const parsedUrl = urlParse(originalUrl, true);
+			const pathname = parsedUrl.pathname || '/';
+
+			// If a basePath is configured for this application, only handle requests that match it.
+			if (basePath !== '/') {
+				const isExactMatch = pathname === basePath;
+				const isPrefixMatch = pathname.startsWith(basePath + '/');
+
+				if (!isExactMatch && !isPrefixMatch) {
+					extensionLogger.debug?.(
+						`serve: request does not match basePath=${basePath}, passing to next handler`
+					);
+					return next(request);
+				}
+
+				// Strip the basePath before forwarding to Next.js so that the app does not
+				// need to be configured with a matching basePath.
+				let strippedPath = '/';
+				if (!isExactMatch) {
+					strippedPath = pathname.slice(basePath.length) || '/';
+				}
+
+				const newPath = strippedPath + (parsedUrl.search ?? '');
+				extensionLogger.debug?.(
+					`serve: rewriting request url from ${originalUrl} to ${newPath} for basePath=${basePath}`
+				);
+
+				request._nodeRequest.url = newPath;
+			}
+
+			return requestHandler(
+				request._nodeRequest,
+				request._nodeResponse,
+				urlParse(request._nodeRequest.url, true)
+			);
 		},
-		{ port: config.port, securePort: config.securePort }
+		httpOptions
 	);
 
 	// Next.js v9 doesn't have an upgrade handler
 	if (config.dev && app.getUpgradeHandler) {
 		const upgradeHandler = app.getUpgradeHandler();
+		extensionLogger.info?.(
+			`serve: registering WebSocket upgrade handler for HMR (port=${config.port}, securePort=${config.securePort}, basePath=${basePath})`
+		);
+
+		const hmrPath =
+			basePath === '/' ? '/_next/webpack-hmr' : `${basePath}/_next/webpack-hmr`;
+
 		server.upgrade(
 			(request, socket, head, next) => {
-				if (request.url === '/_next/webpack-hmr') {
-					// Next.js v13 - v15 upgradeHandler implementations return promises
+				if (request.url === hmrPath) {
+					// Rewrite the URL so Next.js receives the expected HMR path
+					if (basePath !== '/') {
+						request.url = '/_next/webpack-hmr';
+					}
+
 					return upgradeHandler(request, socket, head).then(() => {
 						request.__harperdbRequestUpgraded = true;
 
@@ -395,4 +489,6 @@ async function serve(config, componentPath, server) {
 			{ runFirst: true, port: config.port, securePort: config.securePort }
 		);
 	}
+
+	extensionLogger.info?.('serve: Next.js handler registration complete');
 }
